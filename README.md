@@ -23,7 +23,7 @@ where `rip` is the value of the instruction pointer when the process was
 attached. After the call to `fprintf()` completes, the program will resume
 execution where it was when it was attached, as if nothing has changed.
 
-Note: this code is specific to the Linux implementation of ptrace.
+**Note:** this code is specific to the Linux implementation of ptrace.
 
 ## How It Works
 
@@ -57,3 +57,35 @@ restoring old text
 restoring old registers
 detaching
 ```
+
+## Issues With Yama ptrace_scope
+
+If you get a failure like this:
+```bash
+$ ./call-fprintf 5603
+PTRACE_ATTACH: Operation not permitted
+```
+
+then you are either trying to ptrace a process that you don't have permissions
+to trace (e.g. a process running as aother user), or you have
+[Yama ptrace_scope](https://www.kernel.org/doc/Documentation/security/Yama.txt)
+configured to disallow ptrace. You can check this like this:
+
+```bash
+# everything is good! you can ptrace other processes
+$ sysctl kernel.yama.ptrace_scope
+kernel.yama.ptrace_scope = 0
+
+# uh oh, you can only ptrace your children processes
+$ sysctl kernel.yama.ptrace_scope
+kernel.yama.ptrace_scope = 1
+```
+
+In particular, the default behavior of Ubuntu since Ubuntu 10.10 has been to set
+`kernel.yama.ptrace_scope = 1`. If this affects you, you can either run
+`call-fprintf` as root, or you can run
+
+```bash
+sudo sysctl kernel.yama.ptrace_scope=0
+```
+to get the more permissive behavior.

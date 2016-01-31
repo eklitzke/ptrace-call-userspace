@@ -272,7 +272,7 @@ fail:
   if (ptrace(PTRACE_DETACH, pid, NULL, NULL)) {
     perror("PTRACE_DETACH");
   }
-  return -1;
+  return 1;
 }
 
 int main(int argc, char **argv) {
@@ -293,9 +293,5 @@ int main(int argc, char **argv) {
   if (val < 0) {
     printf("cannot accept negative pids\n");
   }
-  if (printf_process((pid_t)val)) {
-    printf("failed :-(\n");
-    return 1;
-  }
-  return 0;
+  return printf_process((pid_t)val);
 }
