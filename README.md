@@ -62,30 +62,26 @@ detaching
 
 If you get a failure like this:
 ```bash
-$ ./call-fprintf 5603
+$ ./call-fprintf 1
 PTRACE_ATTACH: Operation not permitted
 ```
 
-then you are either trying to ptrace a process that you don't have permissions
-to trace (e.g. a process running as aother user), or you have
+then you are trying to trace a process that you don't have permissions to trace,
+i.e. a process with a different user id than you. You can only ptrace a process
+whose effective user id is the same as yours (or if you are root).
+
+If you instead get a failure like this:
+```bash
+$ ./call-fprintf 5603
+PTRACE_ATTACH: Operation not permitted
+
+The likely cause of this failure is that your system has kernel.yama.ptrace_scope = 1
+If you would like to disable Yama, you can run: sudo sysctl kernel.yama.ptrace_scope=0
+```
+
+Then the issue is that you have
 [Yama ptrace_scope](https://www.kernel.org/doc/Documentation/security/Yama.txt)
-configured to disallow ptrace. You can check this like this:
-
-```bash
-# everything is good! you can ptrace other processes
-$ sysctl kernel.yama.ptrace_scope
-kernel.yama.ptrace_scope = 0
-
-# uh oh, you can only ptrace your children processes
-$ sysctl kernel.yama.ptrace_scope
-kernel.yama.ptrace_scope = 1
-```
-
-In particular, the default behavior of Ubuntu since Ubuntu 10.10 has been to set
-`kernel.yama.ptrace_scope = 1`. If this affects you, you can either run
-`call-fprintf` as root, or you can run
-
-```bash
-sudo sysctl kernel.yama.ptrace_scope=0
-```
-to get the more permissive behavior.
+configured to disallow ptrace. In particular, the default behavior of Ubuntu
+since Ubuntu 10.10 has been to set `kernel.yama.ptrace_scope = 1`. If this
+affects you, you can either run `call-fprintf` as root, or you can run the
+command listed in the error message to disable the Yama setting.

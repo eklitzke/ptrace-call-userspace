@@ -91,10 +91,29 @@ int singlestep(pid_t pid) {
   return status;
 }
 
+void check_yama() {
+  FILE *yama_file = fopen("/proc/sys/kernel/yama/ptrace_scope", "r");
+  if (yama_file == NULL) {
+    return;
+  }
+  char yama_buf[8];
+  memset(yama_buf, 0, sizeof(yama_buf));
+  fread(yama_buf, 1, sizeof(yama_buf), yama_file);
+  if (strcmp(yama_buf, "0\n") != 0) {
+    printf("\nThe likely cause of this failure is that your system has "
+           "kernel.yama.ptrace_scope = %s",
+           yama_buf);
+    printf("If you would like to disable Yama, you can run: "
+           "sudo sysctl kernel.yama.ptrace_scope=0\n");
+  }
+  fclose(yama_file);
+}
+
 int printf_process(pid_t pid) {
   // attach to the process
   if (ptrace(PTRACE_ATTACH, pid, NULL, NULL)) {
     perror("PTRACE_ATTACH");
+    check_yama();
     return 1;
   }
 
