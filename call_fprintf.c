@@ -91,7 +91,7 @@ int singlestep(pid_t pid) {
   return status;
 }
 
-void check_yama() {
+void check_yama(void) {
   FILE *yama_file = fopen("/proc/sys/kernel/yama/ptrace_scope", "r");
   if (yama_file == NULL) {
     return;
@@ -109,7 +109,7 @@ void check_yama() {
   fclose(yama_file);
 }
 
-int printf_process(pid_t pid) {
+int fprintf_process(pid_t pid) {
   // attach to the process
   if (ptrace(PTRACE_ATTACH, pid, NULL, NULL)) {
     perror("PTRACE_ATTACH");
@@ -303,14 +303,14 @@ int main(int argc, char **argv) {
   // should always be true, but checking here just in case
   assert(sizeof(void *) == sizeof(long));
 
-  long val = strtol(argv[1], NULL, 10);
-  if ((errno == ERANGE && (val == LONG_MAX || val == LONG_MIN)) ||
-      (errno != 0 && val == 0)) {
+  long pid = strtol(argv[1], NULL, 10);
+  if ((errno == ERANGE && (pid == LONG_MAX || pid == LONG_MIN)) ||
+      (errno != 0 && pid == 0)) {
     perror("strtol");
     return 1;
   }
-  if (val < 0) {
+  if (pid < 0) {
     printf("cannot accept negative pids\n");
   }
-  return printf_process((pid_t)val);
+  return fprintf_process((pid_t)pid);
 }
