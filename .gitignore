@@ -1,2 +1,2 @@
 *.sw[nop]
-call_fprintf
+call-fprintf

@@ -1,11 +1,11 @@
 CFLAGS := -std=c99 -O2 -Wall -fPIC
 
-all: call_fprintf
+all: call-fprintf
 
-call_fprintf: call_fprintf.c
+call-fprintf: call_fprintf.c
 	$(CC) $(CFLAGS) $< -o $@
 
 clean:
-	rm -f call_fprintf
+	rm -f call-fprintf
 
 .PHONY: all clean
