@@ -232,7 +232,7 @@ int printf_process(pid_t pid) {
   // set up our registers with the args to fprintf
   struct user_regs_struct newregs;
   memmove(&newregs, &oldregs, sizeof(newregs));
-  newregs.rax = 0; // must be zero when calling glibc fprintf, not sure why
+  newregs.rax = 0;                     // no vector registers are used
   newregs.rdi = (long)their_stderr;    // pointer to stderr in the caller
   newregs.rsi = oldregs.rip + CALL_SZ; // pointer to the format string
   newregs.rdx = oldregs.rip;           // the integer we want to print
