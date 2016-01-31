@@ -33,18 +33,18 @@ what is going on, what caveats there are, etc.
 ## Usage
 
 You can compile the code with `make`. You should see that it builds an
-executable called `show_ip`. Then it's invoked like this:
+executable called `call_fprintf`. Invoke it like this:
 
-    show_ip <pid>
+    call_fprintf <pid>
 
 An easy way to test this is to open two terminals, run `echo $$` in the first
 terminal to get the pid of the shell, and then in the other terminal run
-`show_ip` with the first shell's pid.
+`call_fprintf` with the first shell's pid.
 
 When you run the command, you will see output like this:
 
 ```
-$ ./show_ip 5603
+$ ./call_fprintf 5603
 their libc      0x7fcbb47cc000
 their fprintf   0x7fcbb47cc000
 their stderr    0x7fcbb4b88560

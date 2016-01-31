@@ -50,12 +50,20 @@ void *find_library(pid_t pid, const char *libname) {
   return NULL;
 }
 
+// Update the text area of pid at the area starting at where. The data copied
+// should be in the new_text buffer whose size is given by len. If old_text is
+// not null, the original text data will be copied into it. Therefore old_text
+// must have the same size as new_text.
 int poke_text(pid_t pid, void *where, void *new_text, void *old_text,
               size_t len) {
+  if (len % sizeof(void *) != 0) {
+    printf("invalid len, not a multiple of %zd\n", sizeof(void *));
+    return -1;
+  }
+
   long poke_data;
   for (size_t copied = 0; copied < len; copied += sizeof(poke_data)) {
     memmove(&poke_data, new_text + copied, sizeof(poke_data));
-
     if (old_text != NULL) {
       errno = 0;
       long peek_data = ptrace(PTRACE_PEEKTEXT, pid, where + copied, NULL);
@@ -65,7 +73,6 @@ int poke_text(pid_t pid, void *where, void *new_text, void *old_text,
       }
       memmove(old_text + copied, &peek_data, sizeof(peek_data));
     }
-
     if (ptrace(PTRACE_POKETEXT, pid, where + copied, (void *)poke_data) < 0) {
       perror("PTRACE_POKETEXT");
       return -1;
@@ -92,21 +99,24 @@ int printf_process(pid_t pid) {
   }
 
   // wait for the process to actually stop
-  siginfo_t unused_info;
-  waitid(P_PID, pid, &unused_info, WSTOPPED);
+  waitpid(pid, 0, WSTOPPED);
 
-  // Calculate the position of the fprintf routine in the other process' address
-  // space. This is a little bit tricky because of ASLR on Linux. What we do is
+  // Calculate the position of the fprintf routine in the other process'
+  // address
+  // space. This is a little bit tricky because of ASLR on Linux. What we do
+  // is
   // we find the offset in memory that libc has been loaded in their process,
   // and then we find the offset in memory that libc has been loaded in our
-  // process. Then we take the delta betwen our fprintf and our libc start, and
+  // process. Then we take the delta betwen our fprintf and our libc start,
+  // and
   // assume that the same delta will apply to the other process.
   //
   // For this mechanism to work, this program must be compiled with -fPIC to
   // ensure that our fprintf has an address relative to the one in libc.
   //
   // Additionally, this could fail if libc has been updated since the remote
-  // process has been restarted. This is a pretty unlikely situation, but if the
+  // process has been restarted. This is a pretty unlikely situation, but if
+  // the
   // remote process has been running for a long time and you update libc, the
   // offset of the symbols could have changed slightly.
   void *their_libc = find_library(pid, libc_string);
@@ -131,9 +141,11 @@ int printf_process(pid_t pid) {
   //
   // This is a little trickier than it sounds because we need to pass a string
   // into the remote process. Here's how it works. The remote process already
-  // has fprintf and stderr defined, so those are easy. When we make the fprintf
+  // has fprintf and stderr defined, so those are easy. When we make the
+  // fprintf
   // call we can pass the value of rip in via a register, so that's also easy.
-  // However, the remote process doesn't have the string "instruction pointer =
+  // However, the remote process doesn't have the string "instruction pointer
+  // =
   // %p\n" anywhere in its memory.
   //
   // So here's what we're going to do
@@ -146,12 +158,15 @@ int printf_process(pid_t pid) {
   //
   // Then when we resume the process the next instruction will be the CALL
   // instruction into fprintf that we added. This is great, but because we
-  // overwrote data in the .text area it will leave the process' text area in a
+  // overwrote data in the .text area it will leave the process' text area in
+  // a
   // corrupted state. So we will have to restore the old code later.
   //
-  // NOTE: If we are *really* unlucky here we could have attached to the process
+  // NOTE: If we are *really* unlucky here we could have attached to the
+  // process
   // while it is actually in the middle of calling fprintf (or a function that
-  // is called by fprintf). That would be disastrous because it will corrupt the
+  // is called by fprintf). That would be disastrous because it will corrupt
+  // the
   // code that fprintf needs to run. There are two ways to work around this if
   // you want to handle this case:
   //
@@ -186,7 +201,8 @@ int printf_process(pid_t pid) {
   // copy our fprintf format string right after the CALL instruction
   memmove(new_text + offset, format, strlen(format));
 
-  // update the remote process' text area with our new code/string, and save the
+  // update the remote process' text area with our new code/string, and save
+  // the
   // old text that had been there
   printf("poking the text of the remote process\n");
   if (poke_text(pid, (void *)oldregs.rip, new_text, old_text,
@@ -208,11 +224,13 @@ int printf_process(pid_t pid) {
     goto fail;
   }
 
-  // Here we are going to "single step" through the process, which means that it
+  // Here we are going to "single step" through the process, which means that
+  // it
   // will execute one x86 instruction at a time and after each instruction
   // control will return to us. We need to notice when the fprintf routine has
   // finished and returned back to the original code. That happens when rip =
-  // orig_rip + 5 (the extra 5 bytes are from the size of the CALL instruction).
+  // orig_rip + 5 (the extra 5 bytes are from the size of the CALL
+  // instruction).
   printf("single stepping\n");
   int status = singlestep(pid);
   size_t singlestep_count = 1;
@@ -232,7 +250,9 @@ int printf_process(pid_t pid) {
   // Restore the original code that we overwrote; if we don't do this, the
   // program will crash with something like SIGSEGV or SIGILL.
   printf("restoring old text\n");
-  poke_text(pid, (void *)oldregs.rip, old_text, NULL, sizeof(old_text));
+  if (poke_text(pid, (void *)oldregs.rip, old_text, NULL, sizeof(old_text))) {
+    goto fail;
+  }
 
   // restore the old register state that we had clobbered
   printf("restoring old registers\n");
@@ -242,7 +262,6 @@ int printf_process(pid_t pid) {
   }
 
   printf("detaching\n");
-  poke_text(pid, (void *)oldregs.rip, old_text, NULL, sizeof(old_text));
   if (ptrace(PTRACE_DETACH, pid, NULL, NULL)) {
     perror("PTRACE_DETACH");
     goto fail;
@@ -258,15 +277,14 @@ fail:
 
 int main(int argc, char **argv) {
   if (argc != 2) {
-    printf("Usage: show_ip <pid>\n");
+    printf("Usage: %s_ip <pid>\n", argv[0]);
     return 1;
   }
 
   // should always be true, but checking here just in case
   assert(sizeof(void *) == sizeof(long));
 
-  char *str = argv[1];
-  long val = strtol(str, NULL, 10);
+  long val = strtol(argv[1], NULL, 10);
   if ((errno == ERANGE && (val == LONG_MAX || val == LONG_MIN)) ||
       (errno != 0 && val == 0)) {
     perror("strtol");

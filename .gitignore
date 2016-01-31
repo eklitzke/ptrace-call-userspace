@@ -1,2 +1,2 @@
 *.sw[nop]
-show_ip
+call_fprintf
