@@ -3,12 +3,15 @@
 #endif
 
 #include <assert.h>
+#include <ctype.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <getopt.h>
 #include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <string.h>
 #include <sys/ptrace.h>
 #include <sys/types.h>
@@ -81,7 +84,7 @@ int poke_text(pid_t pid, void *where, void *new_text, void *old_text,
   return 0;
 }
 
-int singlestep(pid_t pid) {
+int singlestep_once(pid_t pid) {
   int status;
   if (ptrace(PTRACE_SINGLESTEP, pid, NULL, NULL)) {
     perror("PTRACE_SINGLESTEP");
@@ -89,6 +92,33 @@ int singlestep(pid_t pid) {
   }
   waitpid(pid, &status, 0);
   return status;
+}
+
+int singlestep_many(pid_t pid, unsigned old_rip) {
+  // Here we are going to "single step" through the process, which means that
+  // it
+  // will execute one x86 instruction at a time and after each instruction
+  // control will return to us. We need to notice when the fprintf routine has
+  // finished and returned back to the original code. That happens when rip =
+  // orig_rip + 5 (the extra 5 bytes are from the size of the CALL
+  // instruction).
+  printf("single stepping\n");
+  int status = singlestep_once(pid);
+  size_t singlestep_count = 1;
+  struct user_regs_struct regs;
+  while (WIFSTOPPED(status)) {
+    if (ptrace(PTRACE_GETREGS, pid, NULL, &regs)) {
+      perror("PTRACE_GETREGS");
+      return -1;
+    }
+    if (regs.rip == old_rip + CALL_SZ) {
+      break;
+    }
+    status = singlestep_once(pid);
+    singlestep_count++;
+  }
+  printf("finished single stepping after %zd instructions\n", singlestep_count);
+  return 0;
 }
 
 void check_yama(void) {
@@ -109,7 +139,7 @@ void check_yama(void) {
   fclose(yama_file);
 }
 
-int fprintf_process(pid_t pid) {
+int fprintf_process(pid_t pid, bool trap) {
   // attach to the process
   if (ptrace(PTRACE_ATTACH, pid, NULL, NULL)) {
     perror("PTRACE_ATTACH");
@@ -217,6 +247,12 @@ int fprintf_process(pid_t pid) {
   memmove(new_text + offset, &fprintf_delta32, sizeof(fprintf_delta32));
   offset += sizeof(fprintf_delta32);
 
+  int string_offset = CALL_SZ;
+  if (trap) {
+    new_text[offset++] = 0xcc; // INT 3
+    string_offset++;
+  }
+
   // copy our fprintf format string right after the CALL instruction
   memmove(new_text + offset, format, strlen(format));
 
@@ -232,10 +268,10 @@ int fprintf_process(pid_t pid) {
   // set up our registers with the args to fprintf
   struct user_regs_struct newregs;
   memmove(&newregs, &oldregs, sizeof(newregs));
-  newregs.rax = 0;                     // no vector registers are used
-  newregs.rdi = (long)their_stderr;    // pointer to stderr in the caller
-  newregs.rsi = oldregs.rip + CALL_SZ; // pointer to the format string
-  newregs.rdx = oldregs.rip;           // the integer we want to print
+  newregs.rax = 0;                           // no vector registers are used
+  newregs.rdi = (long)their_stderr;          // pointer to stderr in the caller
+  newregs.rsi = oldregs.rip + string_offset; // pointer to the format string
+  newregs.rdx = oldregs.rip;                 // the integer we want to print
 
   printf("setting the registers of the remote process\n");
   if (ptrace(PTRACE_SETREGS, pid, NULL, &newregs)) {
@@ -243,28 +279,19 @@ int fprintf_process(pid_t pid) {
     goto fail;
   }
 
-  // Here we are going to "single step" through the process, which means that
-  // it
-  // will execute one x86 instruction at a time and after each instruction
-  // control will return to us. We need to notice when the fprintf routine has
-  // finished and returned back to the original code. That happens when rip =
-  // orig_rip + 5 (the extra 5 bytes are from the size of the CALL
-  // instruction).
-  printf("single stepping\n");
-  int status = singlestep(pid);
-  size_t singlestep_count = 1;
-  while (WIFSTOPPED(status)) {
-    if (ptrace(PTRACE_GETREGS, pid, NULL, &newregs)) {
-      perror("PTRACE_GETREGS");
+  if (trap) {
+    int wait_status;
+    ptrace(PTRACE_CONT, pid, NULL, NULL);
+    wait(&wait_status);
+    if (WIFSTOPPED(wait_status)) {
+      printf("Child got a signal: %s\n", strsignal(WSTOPSIG(wait_status)));
+    } else {
+      perror("wait");
       goto fail;
     }
-    if (newregs.rip == oldregs.rip + CALL_SZ) {
-      break;
-    }
-    status = singlestep(pid);
-    singlestep_count++;
+  } else if (!singlestep_many(pid, oldregs.rip)) {
+    goto fail;
   }
-  printf("finished single stepping after %zd instructions\n", singlestep_count);
 
   // Restore the original code that we overwrote; if we don't do this, the
   // program will crash with something like SIGSEGV or SIGILL.
@@ -295,22 +322,60 @@ fail:
 }
 
 int main(int argc, char **argv) {
-  if (argc != 2) {
-    printf("Usage: %s_ip <pid>\n", argv[0]);
+  long pid = -1;
+  bool single_step = false;
+  bool trap = false;
+  int c;
+  opterr = 0;
+  while ((c = getopt(argc, argv, "hstp:")) != -1) {
+    switch (c) {
+    case 'h':
+      printf("Usage: %s -p <pid> [-s|-t]\n", argv[0]);
+      return 0;
+      break;
+    case 's':
+      single_step = true;
+      break;
+    case 't':
+      trap = true;
+      break;
+    case 'p':
+      pid = strtol(optarg, NULL, 10);
+      if ((errno == ERANGE && (pid == LONG_MAX || pid == LONG_MIN)) ||
+          (errno != 0 && pid == 0)) {
+        perror("strtol");
+        return 1;
+      }
+      if (pid < 0) {
+        fprintf(stderr, "cannot accept negative pids\n");
+        return 1;
+      }
+      break;
+    case '?':
+      if (optopt == 'p') {
+        fprintf(stderr, "Option -p requreis an argument.\n");
+      } else if (isprint(optopt)) {
+        fprintf(stderr, "Unknown option `-%c`.\n", optopt);
+      } else {
+        fprintf(stderr, "Unknown option character `\\x%x'.\n", optopt);
+      }
+      return 1;
+      break;
+    default:
+      abort();
+    }
+  }
+  if (single_step && trap) {
+    fprintf(stderr, "options -s and -t are mutually exclusive\n");
     return 1;
   }
-
-  // should always be true, but checking here just in case
-  assert(sizeof(void *) == sizeof(long));
-
-  long pid = strtol(argv[1], NULL, 10);
-  if ((errno == ERANGE && (pid == LONG_MAX || pid == LONG_MIN)) ||
-      (errno != 0 && pid == 0)) {
-    perror("strtol");
+  if (pid == -1) {
+    fprintf(stderr, "must specify a remote process with -p\n");
     return 1;
   }
-  if (pid < 0) {
-    printf("cannot accept negative pids\n");
+  if (!single_step && !trap) {
+    trap = true;
   }
-  return fprintf_process((pid_t)pid);
+
+  return fprintf_process((pid_t)pid, trap);
 }
