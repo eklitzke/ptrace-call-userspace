@@ -45,16 +45,22 @@ When you run the command, you will see output like this:
 
 ```
 $ ./call-fprintf -p 21160
-their %rip           0x7ff5b5e78790
-allocated memory at  0x7ff5b638e000
-their libc           0x7ff5b5db0000
-their fprintf        0x7ff5b5db0000
-their stderr         0x7ff5b616c560
-inserting code/data into the mmap area at 0x7ff5b638e000
+their %rip           0x7f229e153790
+allocated memory at  0x7f229e669000
+executing jump to mmap region
+successfully jumped to mmap area
+their libc           0x7f229e08b000
+their fprintf        0x7f229e08b000
+their stderr         0x7f229e447560
+inserting code/data into the mmap area at 0x7f229e669000
 setting the registers of the remote process
-Child got a signal: Trace/breakpoint trap
-munmap return value is 0
-restoring old text
+continuing execution
+successfully caught TRAP signal
+jumping back to original rip
+successfully jumped back to original %rip at 0x7f229e153790
+making call to mmap
+munmap returned with status 0
+restoring old text at 0x7f229e153790
 restoring old registers
 detaching
 ```

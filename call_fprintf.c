@@ -88,7 +88,6 @@ int singlestep(pid_t pid) {
     return -1;
   }
   waitpid(pid, &status, 0);
-  printf("single step yielded status %d\n", status);
   return status;
 }
 
