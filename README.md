@@ -73,7 +73,7 @@ detaching
 
 If you get a failure like this:
 ```bash
-$ ./call-fprintf 1
+$ ./call-fprintf -p 1
 PTRACE_ATTACH: Operation not permitted
 ```
 
@@ -83,7 +83,7 @@ whose effective user id is the same as yours (or if you are root).
 
 If you instead get a failure like this:
 ```bash
-$ ./call-fprintf 5603
+$ ./call-fprintf -p 5603
 PTRACE_ATTACH: Operation not permitted
 
 The likely cause of this failure is that your system has kernel.yama.ptrace_scope = 1
