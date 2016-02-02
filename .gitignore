@@ -1,2 +1,4 @@
 *.sw[nop]
 call-fprintf
+core.*
+target
