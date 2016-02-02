@@ -1,7 +1,3 @@
-#ifndef _XOPEN_SOURCE
-#define _XOPEN_SOURCE 700
-#endif
-
 #include <assert.h>
 #include <ctype.h>
 #include <dlfcn.h>
@@ -14,13 +10,14 @@
 #include <stdbool.h>
 #include <string.h>
 #include <sys/ptrace.h>
+#include <sys/mman.h>
 #include <sys/types.h>
 #include <sys/user.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
-// number of bytes in a CALL rel32 instruction
-#define CALL_SZ 5
+// number of bytes in a JMP/CALL rel32 instruction
+#define REL32_SZ 5
 
 // copy in the string including the trailing null byte
 static const char *format = "instruction pointer = %p\n";
@@ -94,33 +91,6 @@ int singlestep_once(pid_t pid) {
   return status;
 }
 
-int singlestep_many(pid_t pid, unsigned old_rip) {
-  // Here we are going to "single step" through the process, which means that
-  // it
-  // will execute one x86 instruction at a time and after each instruction
-  // control will return to us. We need to notice when the fprintf routine has
-  // finished and returned back to the original code. That happens when rip =
-  // orig_rip + 5 (the extra 5 bytes are from the size of the CALL
-  // instruction).
-  printf("single stepping\n");
-  int status = singlestep_once(pid);
-  size_t singlestep_count = 1;
-  struct user_regs_struct regs;
-  while (WIFSTOPPED(status)) {
-    if (ptrace(PTRACE_GETREGS, pid, NULL, &regs)) {
-      perror("PTRACE_GETREGS");
-      return -1;
-    }
-    if (regs.rip == old_rip + CALL_SZ) {
-      break;
-    }
-    status = singlestep_once(pid);
-    singlestep_count++;
-  }
-  printf("finished single stepping after %zd instructions\n", singlestep_count);
-  return 0;
-}
-
 void check_yama(void) {
   FILE *yama_file = fopen("/proc/sys/kernel/yama/ptrace_scope", "r");
   if (yama_file == NULL) {
@@ -139,7 +109,17 @@ void check_yama(void) {
   fclose(yama_file);
 }
 
-int fprintf_process(pid_t pid, bool trap) {
+int32_t compute_jmp(void *from, void *to) {
+  int64_t delta = (int64_t)to - (int64_t)from - REL32_SZ;
+  if (delta < INT_MIN || delta > INT_MAX) {
+    printf("cannot do relative jump of size %li; did you compile with -fPIC?\n",
+           delta);
+    exit(1);
+  }
+  return (int32_t)delta;
+}
+
+int fprintf_process(pid_t pid) {
   // attach to the process
   if (ptrace(PTRACE_ATTACH, pid, NULL, NULL)) {
     perror("PTRACE_ATTACH");
@@ -150,128 +130,131 @@ int fprintf_process(pid_t pid, bool trap) {
   // wait for the process to actually stop
   waitpid(pid, 0, WSTOPPED);
 
-  // Calculate the position of the fprintf routine in the other process'
-  // address
-  // space. This is a little bit tricky because of ASLR on Linux. What we do
-  // is
+  // save the register state of the remote process
+  struct user_regs_struct oldregs;
+  if (ptrace(PTRACE_GETREGS, pid, NULL, &oldregs)) {
+    perror("PTRACE_GETREGS");
+    goto fail;
+  }
+  printf("their %%rip           %p\n", (void *)oldregs.rip);
+
+  // First, we are going to allocate some memory for ourselves so we don't need
+  // to stop on the remote process' memory. We will do this by directly invoking
+  // the mmap(2) system call and asking for a single page.
+  struct user_regs_struct newregs;
+  memmove(&newregs, &oldregs, sizeof(newregs));
+  newregs.rax = 9;                           // mmap
+  newregs.rdi = 0;                           // addr
+  newregs.rsi = PAGE_SIZE;                   // length
+  newregs.rdx = PROT_READ | PROT_EXEC;       // prot
+  newregs.r10 = MAP_PRIVATE | MAP_ANONYMOUS; // flags
+  newregs.r8 = -1;                           // fd
+  newregs.r9 = 0;                            //  offset
+
+  uint8_t old_word[8];
+  uint8_t new_word[8];
+  new_word[0] = 0x0f; // SYSCALL
+  new_word[1] = 0x05; // SYSCALL
+
+  // insert the SYSCALL instruction into the process, and save the old word
+  poke_text(pid, (void *)oldregs.rip, new_word, old_word, sizeof(new_word));
+
+  // set the new registers with our syscall arguments
+  if (ptrace(PTRACE_SETREGS, pid, NULL, &newregs)) {
+    perror("PTRACE_SETREGS");
+    return -1;
+  }
+
+  // invoke mmap(2)
+  singlestep_once(pid);
+
+  // read the new register state, so we can see where the mmap went
+  if (ptrace(PTRACE_GETREGS, pid, NULL, &newregs)) {
+    perror("PTRACE_GETREGS");
+    return -1;
+  }
+
+  // this is the address of the memory we allocated
+  void *mmap_memory = (void *)newregs.rax;
+  if (mmap_memory == (void *)-1) {
+    fprintf(stderr, "failed to mmap\n");
+    return -1;
+  }
+  fprintf(stderr, "allocated memory at  %p\n", mmap_memory);
+
+  // Calculate the position of the fprintf routine in the other process' address
+  // space. This is a little bit tricky because of ASLR on Linux. What we do is
   // we find the offset in memory that libc has been loaded in their process,
   // and then we find the offset in memory that libc has been loaded in our
-  // process. Then we take the delta betwen our fprintf and our libc start,
-  // and
+  // process. Then we take the delta betwen our fprintf and our libc start, and
   // assume that the same delta will apply to the other process.
   //
   // For this mechanism to work, this program must be compiled with -fPIC to
   // ensure that our fprintf has an address relative to the one in libc.
   //
   // Additionally, this could fail if libc has been updated since the remote
-  // process has been restarted. This is a pretty unlikely situation, but if
-  // the
+  // process has been restarted. This is a pretty unlikely situation, but if the
   // remote process has been running for a long time and you update libc, the
   // offset of the symbols could have changed slightly.
   void *their_libc = find_library(pid, libc_string);
   void *our_libc = find_library(getpid(), libc_string);
   void *their_fprintf = their_libc + ((void *)fprintf - our_libc);
   FILE *their_stderr = their_libc + ((void *)stderr - our_libc);
-  printf("their libc      %p\n", their_libc);
-  printf("their fprintf   %p\n", their_libc);
-  printf("their stderr    %p\n", their_stderr);
+  printf("their libc           %p\n", their_libc);
+  printf("their fprintf        %p\n", their_libc);
+  printf("their stderr         %p\n", their_stderr);
 
-  // Save the register state of the remote process.
-  struct user_regs_struct oldregs;
-  if (ptrace(PTRACE_GETREGS, pid, NULL, &oldregs)) {
-    perror("PTRACE_GETREGS");
-    goto fail;
-  }
-  printf("their %%rip      %p\n", (void *)oldregs.rip);
+  // set up the next instruction to be a jump to the mmap area
+  new_word[0] = 0xe9; // JMP rel32
+  int32_t jmp_delta = compute_jmp((void *)oldregs.rip, mmap_memory);
+  memmove(new_word + 1, &jmp_delta, sizeof(jmp_delta));
+
+  // set the instruction just after the jump to be a trap
+  // new_word[REL32_SZ] = 0xcc; // TRAP
+
+  // update the new text
+  poke_text(pid, (void *)oldregs.rip, new_word, NULL, sizeof(new_word));
 
   // We want to make a call like:
   //
   //   fprintf(stderr, "instruction pointer = %p\n", rip);
   //
-  // This is a little trickier than it sounds because we need to pass a string
-  // into the remote process. Here's how it works. The remote process already
-  // has fprintf and stderr defined, so those are easy. When we make the
-  // fprintf
-  // call we can pass the value of rip in via a register, so that's also easy.
-  // However, the remote process doesn't have the string "instruction pointer
-  // =
-  // %p\n" anywhere in its memory.
+  // To do this we're going to do the following:
   //
-  // So here's what we're going to do
-  //
-  //  * overwrite the code current at rip with a CALL pointing to fprintf
-  //  * overwrite the code after the CALLL with our format string
-  //  * set up rdi = their_stderr
-  //  * set up rsi = address of the string we just poked into their memory
-  //  * set up rdx = rip
-  //
-  // Then when we resume the process the next instruction will be the CALL
-  // instruction into fprintf that we added. This is great, but because we
-  // overwrote data in the .text area it will leave the process' text area in
-  // a
-  // corrupted state. So we will have to restore the old code later.
-  //
-  // NOTE: If we are *really* unlucky here we could have attached to the
-  // process
-  // while it is actually in the middle of calling fprintf (or a function that
-  // is called by fprintf). That would be disastrous because it will corrupt
-  // the
-  // code that fprintf needs to run. There are two ways to work around this if
-  // you want to handle this case:
-  //
-  //   * Find some unused memory to put the new code into, or even just some
-  //     text area known to not be needed by fprintf (e.g. the text for
-  //     gethostbyname).
-  //   * Allocate new memory, copy the code there, and then deallocate the
-  //     memory when done. The easiest way to do this is to directly make a
-  //     system call to mmap(2) for an anonymous page, and then munmap(2) it
-  //     when you're done.
-  //
-  // Both of these techniques are left as an exercise to the reader.
-  uint8_t new_text[32];
-  uint8_t old_text[sizeof(new_text)];
+  //   * put a CALL instruction into the mmap area that calls fprintf
+  //   * put a TRAP instruction right after the CALL
+  //   * put the format string right after the TRAP
+  //   * use the TRAP to restore the original text/program state
+
+  // memory we are going to copy into our mmap area
+  uint8_t new_text[64];
   memset(new_text, 0, sizeof(new_text));
 
+  // insert a CALL instruction
   size_t offset = 0;
   new_text[offset++] = 0xe8; // CALL rel32
+  int32_t fprintf_delta = compute_jmp(mmap_memory, their_fprintf);
+  memmove(new_text + offset, &fprintf_delta, sizeof(fprintf_delta));
+  offset += sizeof(fprintf_delta);
 
-  // compute the immediate relative value for the CALL rel32
-  int64_t fprintf_delta =
-      (int64_t)their_fprintf - (int64_t)oldregs.rip - CALL_SZ;
-  if (fprintf_delta < INT_MIN || fprintf_delta > INT_MAX) {
-    printf("cannot do relative jump of size %li; did you compile with -fPIC?\n",
-           fprintf_delta);
-    goto fail;
-  }
-  int32_t fprintf_delta32 = (int32_t)fprintf_delta;
-  memmove(new_text + offset, &fprintf_delta32, sizeof(fprintf_delta32));
-  offset += sizeof(fprintf_delta32);
+  // insert a TRAP instruction
+  new_text[offset++] = 0xcc;
 
-  int string_offset = CALL_SZ;
-  if (trap) {
-    new_text[offset++] = 0xcc; // INT 3
-    string_offset++;
-  }
-
-  // copy our fprintf format string right after the CALL instruction
+  // copy our fprintf format string right after the TRAP instruction
   memmove(new_text + offset, format, strlen(format));
 
-  // update the remote process' text area with our new code/string, and save
-  // the
-  // old text that had been there
-  printf("poking the text of the remote process\n");
-  if (poke_text(pid, (void *)oldregs.rip, new_text, old_text,
-                sizeof(new_text))) {
+  // update the mmap area
+  printf("inserting code/data into the mmap area at %p\n", mmap_memory);
+  if (poke_text(pid, mmap_memory, new_text, NULL, sizeof(new_text))) {
     goto fail;
   }
 
   // set up our registers with the args to fprintf
-  struct user_regs_struct newregs;
   memmove(&newregs, &oldregs, sizeof(newregs));
-  newregs.rax = 0;                           // no vector registers are used
-  newregs.rdi = (long)their_stderr;          // pointer to stderr in the caller
-  newregs.rsi = oldregs.rip + string_offset; // pointer to the format string
-  newregs.rdx = oldregs.rip;                 // the integer we want to print
+  newregs.rax = 0;                          // no vector registers are used
+  newregs.rdi = (long)their_stderr;         // pointer to stderr in the caller
+  newregs.rsi = (long)mmap_memory + offset; // pointer to the format string
+  newregs.rdx = oldregs.rip;                // the integer we want to print
 
   printf("setting the registers of the remote process\n");
   if (ptrace(PTRACE_SETREGS, pid, NULL, &newregs)) {
@@ -279,24 +262,44 @@ int fprintf_process(pid_t pid, bool trap) {
     goto fail;
   }
 
-  if (trap) {
-    int wait_status;
-    ptrace(PTRACE_CONT, pid, NULL, NULL);
-    wait(&wait_status);
-    if (WIFSTOPPED(wait_status)) {
-      printf("Child got a signal: %s\n", strsignal(WSTOPSIG(wait_status)));
-    } else {
-      perror("wait");
-      goto fail;
-    }
-  } else if (!singlestep_many(pid, oldregs.rip)) {
+  // continue the program, and wait for the trap
+  int wait_status;
+  ptrace(PTRACE_CONT, pid, NULL, NULL);
+  wait(&wait_status);
+  if (WIFSTOPPED(wait_status)) {
+    printf("Child got a signal: %s\n", strsignal(WSTOPSIG(wait_status)));
+  } else {
+    perror("wait");
     goto fail;
   }
+
+  // unmap the memory we allocated
+  newregs.rax = 11;                // munmap
+  newregs.rdi = (long)mmap_memory; // addr
+  newregs.rsi = PAGE_SIZE;         // size
+
+  new_word[0] = 0x0f;
+  new_word[1] = 0x05;
+
+  // arrange for the system call to munmap to happen
+  poke_text(pid, (void *)oldregs.rip, new_word, NULL, sizeof(new_word));
+  if (ptrace(PTRACE_SETREGS, pid, NULL, &newregs)) {
+    perror("PTRACE_SETREGS");
+    return -1;
+  }
+  singlestep_once(pid);
+
+  // check the return value
+  if (ptrace(PTRACE_GETREGS, pid, NULL, &newregs)) {
+    perror("PTRACE_GETREGS");
+    return -1;
+  }
+  fprintf(stderr, "munmap return value is %d\n", (int)newregs.rax);
 
   // Restore the original code that we overwrote; if we don't do this, the
   // program will crash with something like SIGSEGV or SIGILL.
   printf("restoring old text\n");
-  if (poke_text(pid, (void *)oldregs.rip, old_text, NULL, sizeof(old_text))) {
+  if (poke_text(pid, (void *)oldregs.rip, old_word, NULL, sizeof(old_word))) {
     goto fail;
   }
 
@@ -307,6 +310,7 @@ int fprintf_process(pid_t pid, bool trap) {
     goto fail;
   }
 
+  // detach the process
   printf("detaching\n");
   if (ptrace(PTRACE_DETACH, pid, NULL, NULL)) {
     perror("PTRACE_DETACH");
@@ -323,21 +327,13 @@ fail:
 
 int main(int argc, char **argv) {
   long pid = -1;
-  bool single_step = false;
-  bool trap = false;
   int c;
   opterr = 0;
-  while ((c = getopt(argc, argv, "hstp:")) != -1) {
+  while ((c = getopt(argc, argv, "hp:")) != -1) {
     switch (c) {
     case 'h':
       printf("Usage: %s -p <pid> [-s|-t]\n", argv[0]);
       return 0;
-      break;
-    case 's':
-      single_step = true;
-      break;
-    case 't':
-      trap = true;
       break;
     case 'p':
       pid = strtol(optarg, NULL, 10);
@@ -365,17 +361,9 @@ int main(int argc, char **argv) {
       abort();
     }
   }
-  if (single_step && trap) {
-    fprintf(stderr, "options -s and -t are mutually exclusive\n");
-    return 1;
-  }
   if (pid == -1) {
     fprintf(stderr, "must specify a remote process with -p\n");
     return 1;
   }
-  if (!single_step && !trap) {
-    trap = true;
-  }
-
-  return fprintf_process((pid_t)pid, trap);
+  return fprintf_process((pid_t)pid);
 }
