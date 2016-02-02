@@ -30,6 +30,10 @@ execution where it was when it was attached, as if nothing has changed.
 Just look at the source code. There are a *lot* of comments explaining exactly
 what is going on, what caveats there are, etc.
 
+I also wrote some articles about this program
+[here (part 1)](https://eklitzke.org/ptrace) and
+[here (part 2)](https://eklitzke.org/ptrace-continued).
+
 ## Usage
 
 You can compile the code with `make`. You should see that it builds an
