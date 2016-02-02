@@ -81,14 +81,30 @@ int poke_text(pid_t pid, void *where, void *new_text, void *old_text,
   return 0;
 }
 
-int singlestep(pid_t pid) {
+int do_wait(const char *name) {
   int status;
+  if (wait(&status) == -1) {
+    perror("wait");
+    return -1;
+  }
+  if (WIFSTOPPED(status)) {
+    if (WSTOPSIG(status) == SIGTRAP) {
+      return 0;
+    }
+    printf("%s unexpectedly got status %s\n", name, strsignal(status));
+    return -1;
+  }
+  printf("%s got unexpected status %d\n", name, status);
+  return -1;
+
+}
+
+int singlestep(pid_t pid) {
   if (ptrace(PTRACE_SINGLESTEP, pid, NULL, NULL)) {
     perror("PTRACE_SINGLESTEP");
     return -1;
   }
-  waitpid(pid, &status, 0);
-  return status;
+  return do_wait("PTRACE_SINGLESTEP");
 }
 
 void check_yama(void) {
@@ -124,11 +140,14 @@ int fprintf_process(pid_t pid) {
   if (ptrace(PTRACE_ATTACH, pid, NULL, NULL)) {
     perror("PTRACE_ATTACH");
     check_yama();
-    return 1;
+    return -1;
   }
 
   // wait for the process to actually stop
-  waitpid(pid, 0, WSTOPPED);
+  if (waitpid(pid, 0, WSTOPPED) == -1) {
+    perror("wait");
+    return -1;
+  }
 
   // save the register state of the remote process
   struct user_regs_struct oldregs;
@@ -140,8 +159,10 @@ int fprintf_process(pid_t pid) {
   void *rip = (void *)oldregs.rip;
   printf("their %%rip           %p\n", rip);
 
-  // First, we are going to allocate some memory for ourselves so we don't need
-  // to stop on the remote process' memory. We will do this by directly invoking
+  // First, we are going to allocate some memory for ourselves so we don't
+  // need
+  // to stop on the remote process' memory. We will do this by directly
+  // invoking
   // the mmap(2) system call and asking for a single page.
   struct user_regs_struct newregs;
   memmove(&newregs, &oldregs, sizeof(newregs));
@@ -168,11 +189,13 @@ int fprintf_process(pid_t pid) {
   // set the new registers with our syscall arguments
   if (ptrace(PTRACE_SETREGS, pid, NULL, &newregs)) {
     perror("PTRACE_SETREGS");
-    return -1;
+    goto fail;
   }
 
   // invoke mmap(2)
-  singlestep(pid);
+  if (singlestep(pid)) {
+    goto fail;
+  }
 
   // read the new register state, so we can see where the mmap went
   if (ptrace(PTRACE_GETREGS, pid, NULL, &newregs)) {
@@ -189,7 +212,9 @@ int fprintf_process(pid_t pid) {
   printf("allocated memory at  %p\n", mmap_memory);
 
   printf("executing jump to mmap region\n");
-  singlestep(pid);
+  if (singlestep(pid)) {
+    goto fail;
+  }
 
   if (ptrace(PTRACE_GETREGS, pid, NULL, &newregs)) {
     perror("PTRACE_GETREGS");
@@ -202,18 +227,22 @@ int fprintf_process(pid_t pid) {
     goto fail;
   }
 
-  // Calculate the position of the fprintf routine in the other process' address
-  // space. This is a little bit tricky because of ASLR on Linux. What we do is
+  // Calculate the position of the fprintf routine in the other process'
+  // address
+  // space. This is a little bit tricky because of ASLR on Linux. What we do
+  // is
   // we find the offset in memory that libc has been loaded in their process,
   // and then we find the offset in memory that libc has been loaded in our
-  // process. Then we take the delta betwen our fprintf and our libc start, and
+  // process. Then we take the delta betwen our fprintf and our libc start,
+  // and
   // assume that the same delta will apply to the other process.
   //
   // For this mechanism to work, this program must be compiled with -fPIC to
   // ensure that our fprintf has an address relative to the one in libc.
   //
   // Additionally, this could fail if libc has been updated since the remote
-  // process has been restarted. This is a pretty unlikely situation, but if the
+  // process has been restarted. This is a pretty unlikely situation, but if
+  // the
   // remote process has been running for a long time and you update libc, the
   // offset of the symbols could have changed slightly.
   void *their_libc = find_library(pid, libc_string);
@@ -277,19 +306,8 @@ int fprintf_process(pid_t pid) {
 
   // continue the program, and wait for the trap
   printf("continuing execution\n");
-  int wait_status;
   ptrace(PTRACE_CONT, pid, NULL, NULL);
-  wait(&wait_status);
-  if (WIFSTOPPED(wait_status)) {
-    int signal = WSTOPSIG(wait_status);
-    if (signal == SIGTRAP) {
-      printf("successfully caught TRAP signal\n");
-    } else {
-      printf("unexpectedly got signal: %s\n", strsignal(signal));
-      goto fail;
-    }
-  } else {
-    perror("wait");
+  if (do_wait("PTRACE_CONT")) {
     goto fail;
   }
 
@@ -308,7 +326,9 @@ int fprintf_process(pid_t pid) {
   poke_text(pid, (void *)newregs.rip, new_word, NULL, sizeof(new_word));
 
   printf("jumping back to original rip\n");
-  singlestep(pid);
+  if (singlestep(pid)) {
+    goto fail;
+  }
   if (ptrace(PTRACE_GETREGS, pid, NULL, &newregs)) {
     perror("PTRACE_GETREGS");
     goto fail;
@@ -333,7 +353,9 @@ int fprintf_process(pid_t pid) {
 
   // make the system call
   printf("making call to mmap\n");
-  singlestep(pid);
+  if (singlestep(pid)) {
+    goto fail;
+  }
   if (ptrace(PTRACE_GETREGS, pid, NULL, &newregs)) {
     perror("PTRACE_GETREGS");
     goto fail;
