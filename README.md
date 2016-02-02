@@ -35,7 +35,7 @@ what is going on, what caveats there are, etc.
 You can compile the code with `make`. You should see that it builds an
 executable called `call-fprintf`. Invoke it like this:
 
-    call-fprintf <pid>
+    call-fprintf -p <pid>
 
 An easy way to test this is to open two terminals, run `echo $$` in the first
 terminal to get the pid of the shell, and then in the other terminal run
@@ -44,15 +44,16 @@ terminal to get the pid of the shell, and then in the other terminal run
 When you run the command, you will see output like this:
 
 ```
-$ ./call-fprintf 5603
-their libc      0x7fcbb47cc000
-their fprintf   0x7fcbb47cc000
-their stderr    0x7fcbb4b88560
-their %rip      0x7fcbb48bebb0
-poking the text of the remote process
+$ ./call-fprintf -p 21160
+their %rip           0x7ff5b5e78790
+allocated memory at  0x7ff5b638e000
+their libc           0x7ff5b5db0000
+their fprintf        0x7ff5b5db0000
+their stderr         0x7ff5b616c560
+inserting code/data into the mmap area at 0x7ff5b638e000
 setting the registers of the remote process
-single stepping
-finished single stepping after 1150 instructions
+Child got a signal: Trace/breakpoint trap
+munmap return value is 0
 restoring old text
 restoring old registers
 detaching

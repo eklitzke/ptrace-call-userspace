@@ -177,10 +177,10 @@ int fprintf_process(pid_t pid) {
   // this is the address of the memory we allocated
   void *mmap_memory = (void *)newregs.rax;
   if (mmap_memory == (void *)-1) {
-    fprintf(stderr, "failed to mmap\n");
+    printf("failed to mmap\n");
     return -1;
   }
-  fprintf(stderr, "allocated memory at  %p\n", mmap_memory);
+  printf("allocated memory at  %p\n", mmap_memory);
 
   // Calculate the position of the fprintf routine in the other process' address
   // space. This is a little bit tricky because of ASLR on Linux. What we do is
