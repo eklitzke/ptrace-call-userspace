@@ -1,4 +1,4 @@
-CFLAGS := -std=gnu99 -O2 -Wall -fPIC
+CFLAGS := -std=gnu99 -O2 -Wall -fPIC -g
 
 all: call-fprintf target
 

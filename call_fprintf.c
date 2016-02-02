@@ -81,13 +81,14 @@ int poke_text(pid_t pid, void *where, void *new_text, void *old_text,
   return 0;
 }
 
-int singlestep_once(pid_t pid) {
+int singlestep(pid_t pid) {
   int status;
   if (ptrace(PTRACE_SINGLESTEP, pid, NULL, NULL)) {
     perror("PTRACE_SINGLESTEP");
     return -1;
   }
   waitpid(pid, &status, 0);
+  printf("single step yielded status %d\n", status);
   return status;
 }
 
@@ -134,9 +135,11 @@ int fprintf_process(pid_t pid) {
   struct user_regs_struct oldregs;
   if (ptrace(PTRACE_GETREGS, pid, NULL, &oldregs)) {
     perror("PTRACE_GETREGS");
-    goto fail;
+    ptrace(PTRACE_DETACH, pid, NULL, NULL);
+    return -1;
   }
-  printf("their %%rip           %p\n", (void *)oldregs.rip);
+  void *rip = (void *)oldregs.rip;
+  printf("their %%rip           %p\n", rip);
 
   // First, we are going to allocate some memory for ourselves so we don't need
   // to stop on the remote process' memory. We will do this by directly invoking
@@ -155,9 +158,13 @@ int fprintf_process(pid_t pid) {
   uint8_t new_word[8];
   new_word[0] = 0x0f; // SYSCALL
   new_word[1] = 0x05; // SYSCALL
+  new_word[2] = 0xff; // JMP %rax
+  new_word[3] = 0xe0; // JMP %rax
 
   // insert the SYSCALL instruction into the process, and save the old word
-  poke_text(pid, (void *)oldregs.rip, new_word, old_word, sizeof(new_word));
+  if (poke_text(pid, rip, new_word, old_word, sizeof(new_word))) {
+    goto fail;
+  }
 
   // set the new registers with our syscall arguments
   if (ptrace(PTRACE_SETREGS, pid, NULL, &newregs)) {
@@ -166,7 +173,7 @@ int fprintf_process(pid_t pid) {
   }
 
   // invoke mmap(2)
-  singlestep_once(pid);
+  singlestep(pid);
 
   // read the new register state, so we can see where the mmap went
   if (ptrace(PTRACE_GETREGS, pid, NULL, &newregs)) {
@@ -178,9 +185,23 @@ int fprintf_process(pid_t pid) {
   void *mmap_memory = (void *)newregs.rax;
   if (mmap_memory == (void *)-1) {
     printf("failed to mmap\n");
-    return -1;
+    goto fail;
   }
   printf("allocated memory at  %p\n", mmap_memory);
+
+  printf("executing jump to mmap region\n");
+  singlestep(pid);
+
+  if (ptrace(PTRACE_GETREGS, pid, NULL, &newregs)) {
+    perror("PTRACE_GETREGS");
+    goto fail;
+  }
+  if (newregs.rip == (long)mmap_memory) {
+    printf("successfully jumped to mmap area\n");
+  } else {
+    printf("unexpectedly jumped to %p\n", (void *)newregs.rip);
+    goto fail;
+  }
 
   // Calculate the position of the fprintf routine in the other process' address
   // space. This is a little bit tricky because of ASLR on Linux. What we do is
@@ -204,17 +225,6 @@ int fprintf_process(pid_t pid) {
   printf("their fprintf        %p\n", their_libc);
   printf("their stderr         %p\n", their_stderr);
 
-  // set up the next instruction to be a jump to the mmap area
-  new_word[0] = 0xe9; // JMP rel32
-  int32_t jmp_delta = compute_jmp((void *)oldregs.rip, mmap_memory);
-  memmove(new_word + 1, &jmp_delta, sizeof(jmp_delta));
-
-  // set the instruction just after the jump to be a trap
-  // new_word[REL32_SZ] = 0xcc; // TRAP
-
-  // update the new text
-  poke_text(pid, (void *)oldregs.rip, new_word, NULL, sizeof(new_word));
-
   // We want to make a call like:
   //
   //   fprintf(stderr, "instruction pointer = %p\n", rip);
@@ -227,7 +237,7 @@ int fprintf_process(pid_t pid) {
   //   * use the TRAP to restore the original text/program state
 
   // memory we are going to copy into our mmap area
-  uint8_t new_text[64];
+  uint8_t new_text[32];
   memset(new_text, 0, sizeof(new_text));
 
   // insert a CALL instruction
@@ -249,8 +259,12 @@ int fprintf_process(pid_t pid) {
     goto fail;
   }
 
+  if (poke_text(pid, rip, new_word, NULL, sizeof(new_word))) {
+    goto fail;
+  }
+
   // set up our registers with the args to fprintf
-  memmove(&newregs, &oldregs, sizeof(newregs));
+  // memmove(&newregs, &oldregs, sizeof(newregs));
   newregs.rax = 0;                          // no vector registers are used
   newregs.rdi = (long)their_stderr;         // pointer to stderr in the caller
   newregs.rsi = (long)mmap_memory + offset; // pointer to the format string
@@ -263,13 +277,49 @@ int fprintf_process(pid_t pid) {
   }
 
   // continue the program, and wait for the trap
+  printf("continuing execution\n");
   int wait_status;
   ptrace(PTRACE_CONT, pid, NULL, NULL);
   wait(&wait_status);
   if (WIFSTOPPED(wait_status)) {
-    printf("Child got a signal: %s\n", strsignal(WSTOPSIG(wait_status)));
+    int signal = WSTOPSIG(wait_status);
+    if (signal == SIGTRAP) {
+      printf("successfully caught TRAP signal\n");
+    } else {
+      printf("unexpectedly got signal: %s\n", strsignal(signal));
+      goto fail;
+    }
   } else {
     perror("wait");
+    goto fail;
+  }
+
+  if (ptrace(PTRACE_GETREGS, pid, NULL, &newregs)) {
+    perror("PTRACE_GETREGS");
+    goto fail;
+  }
+  newregs.rax = (long)rip;
+  if (ptrace(PTRACE_SETREGS, pid, NULL, &newregs)) {
+    perror("PTRACE_SETREGS");
+    goto fail;
+  }
+
+  new_word[0] = 0xff; // JMP %rax
+  new_word[1] = 0xe0; // JMP %rax
+  poke_text(pid, (void *)newregs.rip, new_word, NULL, sizeof(new_word));
+
+  printf("jumping back to original rip\n");
+  singlestep(pid);
+  if (ptrace(PTRACE_GETREGS, pid, NULL, &newregs)) {
+    perror("PTRACE_GETREGS");
+    goto fail;
+  }
+
+  if (newregs.rip == (long)rip) {
+    printf("successfully jumped back to original %%rip at %p\n", rip);
+  } else {
+    printf("unexpectedly jumped to %p (expected to be at %p)\n",
+           (void *)newregs.rip, rip);
     goto fail;
   }
 
@@ -277,33 +327,23 @@ int fprintf_process(pid_t pid) {
   newregs.rax = 11;                // munmap
   newregs.rdi = (long)mmap_memory; // addr
   newregs.rsi = PAGE_SIZE;         // size
-
-  new_word[0] = 0x0f;
-  new_word[1] = 0x05;
-
-  // arrange for the system call to munmap to happen
-  poke_text(pid, (void *)oldregs.rip, new_word, NULL, sizeof(new_word));
   if (ptrace(PTRACE_SETREGS, pid, NULL, &newregs)) {
     perror("PTRACE_SETREGS");
-    return -1;
-  }
-  singlestep_once(pid);
-
-  // check the return value
-  if (ptrace(PTRACE_GETREGS, pid, NULL, &newregs)) {
-    perror("PTRACE_GETREGS");
-    return -1;
-  }
-  fprintf(stderr, "munmap return value is %d\n", (int)newregs.rax);
-
-  // Restore the original code that we overwrote; if we don't do this, the
-  // program will crash with something like SIGSEGV or SIGILL.
-  printf("restoring old text\n");
-  if (poke_text(pid, (void *)oldregs.rip, old_word, NULL, sizeof(old_word))) {
     goto fail;
   }
 
-  // restore the old register state that we had clobbered
+  // make the system call
+  printf("making call to mmap\n");
+  singlestep(pid);
+  if (ptrace(PTRACE_GETREGS, pid, NULL, &newregs)) {
+    perror("PTRACE_GETREGS");
+    goto fail;
+  }
+  printf("munmap returned with status %llu\n", newregs.rax);
+
+  printf("restoring old text at %p\n", rip);
+  poke_text(pid, rip, old_word, NULL, sizeof(old_word));
+
   printf("restoring old registers\n");
   if (ptrace(PTRACE_SETREGS, pid, NULL, &oldregs)) {
     perror("PTRACE_SETREGS");
@@ -319,6 +359,7 @@ int fprintf_process(pid_t pid) {
   return 0;
 
 fail:
+  poke_text(pid, rip, old_word, NULL, sizeof(old_word));
   if (ptrace(PTRACE_DETACH, pid, NULL, NULL)) {
     perror("PTRACE_DETACH");
   }
