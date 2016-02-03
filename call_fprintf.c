@@ -394,7 +394,7 @@ int main(int argc, char **argv) {
   while ((c = getopt(argc, argv, "hp:")) != -1) {
     switch (c) {
     case 'h':
-      printf("Usage: %s -p <pid> [-s|-t]\n", argv[0]);
+      printf("Usage: %s -p <pid>\n", argv[0]);
       return 0;
       break;
     case 'p':
@@ -411,7 +411,7 @@ int main(int argc, char **argv) {
       break;
     case '?':
       if (optopt == 'p') {
-        fprintf(stderr, "Option -p requreis an argument.\n");
+        fprintf(stderr, "Option -p requires an argument.\n");
       } else if (isprint(optopt)) {
         fprintf(stderr, "Unknown option `-%c`.\n", optopt);
       } else {
