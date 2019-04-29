@@ -250,7 +250,7 @@ int fprintf_process(pid_t pid) {
   void *their_fprintf = their_libc + ((void *)fprintf - our_libc);
   FILE *their_stderr = their_libc + ((void *)stderr - our_libc);
   printf("their libc           %p\n", their_libc);
-  printf("their fprintf        %p\n", their_libc);
+  printf("their fprintf        %p\n", their_fprintf);
   printf("their stderr         %p\n", their_stderr);
 
   // We want to make a call like:
